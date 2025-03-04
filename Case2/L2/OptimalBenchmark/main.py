@@ -1,0 +1,171 @@
+import pandas as pd
+import numpy as np
+import scipy.stats as stats
+from gurobipy import *
+import time
+
+'''
+本脚本直接用Gurobi求解P1，作为Optimal Benchmark
+'''
+
+np.random.seed(100)
+df = pd.read_excel('BeijingTrafficNetwork.xlsx')
+
+start_node = df['From'].tolist()
+end_node = df['To'].tolist()
+Length = df['length (km)'].tolist()
+speed_limit_old = df['speed limit (km/h)']
+
+# 常参数
+alpha = 0.15
+rho_ave = 0.7673
+q_t = 25
+p_ch = 30
+emax = 80
+emin = 0
+Vmax = 40
+Vmin = 20
+beta = 1
+
+SOC = np.array([np.random.uniform(low=0.4, high=0.6, )])
+e_ini = emax * SOC[0]
+print("初始SOC:", SOC)
+# 给定OD
+ns = 4
+ne = 30
+
+arcs = []
+for i in df.index:
+    arcs.append((start_node[i], end_node[i]))
+    arcs.append((end_node[i], start_node[i]))
+
+# print(arcs)
+nodes = list(range(41))
+
+# 生成GPL数据
+length = {}
+Vij = {}
+# speed_limit = speed_limit_old   # 赋初值
+for i in df.index:
+    length[arcs[2 * i]] = Length[i]
+    length[arcs[2 * i + 1]] = length[arcs[2 * i]]
+
+    speed_limit = speed_limit_old[i]
+
+    mu = 0.9 * speed_limit
+    sigma = 0.05 * speed_limit
+    lower = mu - 2 * sigma
+    upper = mu + 2 * sigma
+    velocity = stats.truncnorm((lower - mu) / sigma, (upper - mu) / sigma, loc=mu, scale=sigma)
+    # 使用随机数
+    Vij[arcs[2 * i]] = velocity.rvs(1)[0]
+    Vij[arcs[2 * i + 1]] = Vij[arcs[2 * i]]  # 正反向车道速度相等
+
+WCLs = [(12, 13), (13, 12), (14, 15), (15, 14), (16, 17), (17, 16), (18, 19), (19, 18),
+        (20, 21), (21, 20), (22, 23), (23, 22)]
+Mch = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+Nch = [13, 12, 15, 14, 17, 16, 19, 18, 21, 20, 23, 22]
+rho_ch_mu = [0.4, 0.4, 0.5, 0.5, 0.4, 0.4, 0.5, 0.5, 0.6, 0.6, 0.3, 0.3]
+speedWCL_mu = [31, 31, 35, 35, 34, 34, 31, 31, 32, 32, 29, 29]
+
+# 生成WCL数据
+rho_ch_s = {}  # CNY/kwh 各WCL实时充电价格
+Vmn = {}  # 各WCL上行驶速度
+C = {}  # 道路拥堵程度
+ech_max = {}  # 各WCL上最大充电量
+
+for k in range(12):
+    mu = rho_ch_mu[k]
+    sigma = 0.15 * mu
+    lower = mu - 2 * sigma
+    upper = mu + 2 * sigma
+    rho_ch = stats.truncnorm((lower - mu) / sigma, (upper - mu) / sigma, loc=mu, scale=sigma)
+    rho_ch_s[WCLs[k]] = rho_ch.rvs(1)[0]
+
+    speedWCL_sigma = 0.15 * speedWCL_mu[k]
+    Vmn_lower = 0
+    Vmn_upper = 40
+    Vmn_dist = stats.truncnorm((Vmn_lower - speedWCL_mu[k]) / speedWCL_sigma,
+                               (Vmn_upper - speedWCL_mu[k]) / speedWCL_sigma,
+                               loc=speedWCL_mu[k], scale=speedWCL_sigma)
+    Vmn[WCLs[k]] = Vmn_dist.rvs(1)[0]
+
+    # 计算充电车道的拥堵程度C
+    if Vmn[WCLs[k]] < Vmin:
+        C[WCLs[k]] = 1 - Vmn[WCLs[k]] / Vmin
+    else:
+        C[WCLs[k]] = 0
+
+    ech_max[WCLs[k]] = length[WCLs[k]] / Vmn[WCLs[k]] * p_ch
+
+
+print('路长', length)
+print('GPL速度：', Vij)
+print('WCL电价', rho_ch_s)
+print('WCL速度', Vmn)
+print('拥堵偏好', C)
+print('WCL最大充电量', ech_max)
+
+
+# MIP  model formulation
+m = Model('optimal benchmark')
+
+# Add variables
+x = m.addVars(arcs, vtype=GRB.BINARY, name="xij")
+y = m.addVars(arcs, vtype=GRB.BINARY, name="yij")
+z = m.addVars(WCLs, vtype=GRB.BINARY, name="zmn")
+Em = m.addVar(vtype=GRB.CONTINUOUS, ub=GRB.INFINITY, lb=-GRB.INFINITY, name="EVenergy")
+ech = m.addVar(vtype=GRB.CONTINUOUS, name="ChargingEnergy")
+Travel = m.addVar(name="TravelCost")
+Charge = m.addVar(ub=GRB.INFINITY, lb=-GRB.INFINITY, name="ChargeCost")
+delta = m.addVar(vtype=GRB.BINARY, name="AuxiliaryVariables")
+
+# Set objective
+m.setObjective(Travel + Charge, GRB.MINIMIZE)
+
+# Add constraints
+m.addConstr(Travel == alpha * rho_ave * quicksum(length[ar] * (x[ar] + y[ar]) for ar in arcs)
+            + q_t * quicksum(length[ar] / Vij[ar] * (x[ar] + y[ar]) for ar in arcs), name="Travelcost")
+
+m.addConstr(Charge == ech * quicksum(rho_ch_s[WCL] * z[WCL] * (1 - beta * C[WCL]) for WCL in WCLs), name="Chargecost")
+
+m.addConstr(Em == e_ini - alpha * quicksum(length[ar] * x[ar] for ar in arcs), name="EV energy before charging")
+
+m.addConstr(Em >= emin, name="min energy before charging")
+
+M = 100000   # 大M法处理min约束
+m.addConstr(ech <= (emax - Em) + M * (1 - delta), name="min-1")
+m.addConstr(ech >= (emax - Em) - M * (1 - delta), name="min-2")
+m.addConstr(ech <= quicksum(ech_max[WCL] * z[WCL] for WCL in WCLs) + M * delta, name="min-3")
+m.addConstr(ech >= quicksum(ech_max[WCL] * z[WCL] for WCL in WCLs) - M * delta, name="min-4")
+m.addConstr(quicksum(ech_max[WCL] * z[WCL] for WCL in WCLs) <= (emax - Em) + M * delta, name="min-5")
+m.addConstr((emax - Em) <= quicksum(ech_max[WCL] * z[WCL] for WCL in WCLs) + M * (1 - delta), name="min-6")
+
+nodes_x = [node for node in nodes if node not in Mch]
+nodes_x.remove(ns)
+
+m.addConstr(x.sum(ns, '*') - x.sum('*', ns) == 1, name="Route Continuity for x-1")
+m.addConstrs((x.sum(WCL[0], '*') - x.sum('*', WCL[0]) == -z[WCL] for WCL in WCLs), name="Route Continuity for x-2")
+m.addConstrs((x.sum(i, '*') - x.sum('*', i) == 0 for i in nodes_x), name="Route Continuity for x-3")
+
+nodes_y = [node for node in nodes if node not in Nch]
+nodes_y.remove(ne)
+
+m.addConstrs((y.sum(WCL[1], '*') - y.sum('*', WCL[1]) == z[WCL] for WCL in WCLs), name="Route Continuity for y-1")
+m.addConstr(y.sum(ne, '*') - y.sum('*', ne) == -1, name="Route Continuity for y-2")
+m.addConstrs((y.sum(i, '*') - y.sum('*', i) == 0 for i in nodes_y), name="Route Continuity for y-3")
+
+m.addConstr(quicksum(z[WCL] for WCL in WCLs) == 1, name="Choose one WCL")
+
+
+m.update()
+m.setParam('OutputFlag', 0)
+
+
+m.optimize()
+
+for v in m.getVars():
+    print(f"{v.varName}：{round(v.x, 3)}")
+
+print("总Obj:", m.objVal)
+print("辅助函数值：", delta.x)
